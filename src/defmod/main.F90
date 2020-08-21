@@ -182,6 +182,8 @@ program main
         work(i)=j; j=j+1
      end if
   end do
+  allocate(nmap_re(nnds))
+  nmap_re=work
   n=sum(npart); allocate(coords(n,dmn),bc(n,dmn+p))
   j=1
   do i=1,nnds
@@ -247,8 +249,8 @@ program main
      !   print'(6(F0.6X))',matDstr(1,5,i,:)
      !end do
   end if
-  deallocate(epart,npart)
-
+  ! deallocate(epart,npart)
+  deallocate(epart)
   ! Initialize local element variables and global U
   allocate(ipoint(nip,dmn),weight(nip),k(ef_eldof,ef_eldof),m(eldof,eldof),    &
      f(ef_eldof),indx(ef_eldof),enodes(npel),ecoords(npel,dmn),vvec(dmn+p))
@@ -438,7 +440,7 @@ program main
      if (fault .or. gf .or. galf) then
         allocate(node_pos(nfnd),node_neg(nfnd),vecf(nfnd,dmn*dmn),fc(nfnd),    &
            fcd(nfnd),dc(nfnd),perm(nfnd),st_init(nfnd,dmn),xfnd(nfnd,dmn),     &
-           frc(nfnd),coh(nfnd),dcoh(nfnd),biot(nfnd))
+           frc(nfnd),coh(nfnd),dcoh(nfnd),biot(nfnd),node_pos_g(nfnd))
         ! Have frictional fault intersection
         ! xpair global fault node id paired with intersection
         ! vecxf alternative fault (strike,dip,normal) vectors at intersection
@@ -469,6 +471,7 @@ program main
                    dc(i),st_init(i,:),xfnd(i,:),frc(i),coh(i),dcoh(i)
               end if
            end if
+           node_pos_g(i)=node_pos(i)
            node_pos(i)=nmap(node_pos(i)); node_neg(i)=nmap(node_neg(i))
         end do
         if (Xflt>1) then
@@ -619,7 +622,7 @@ program main
   end if
   close(10)
   if (fvin>2) call MakeEl2g
-  deallocate(nmap,emap) ! End of input reading
+  deallocate(emap) ! End of input reading
   t2=MPI_Wtime()
   if (rank==0) print'(F0.2,A)',t2-t1," seconds to assemble."
 
@@ -1505,6 +1508,7 @@ program main
            call VecZeroEntries(Vec_F,ierr)
            call PrintMsg(" Reforming RHS ...")
            if (poro) then
+              ! ADD THE pressure contribution (seems Vec_Um contains tot_uu)
               call VecGetSubVector(Vec_Um,RI,Vec_Up,ierr)
               call MatMult(Mat_Kc,Vec_Up,Vec_I,ierr)
               call VecScale(Vec_I,-dt,ierr)
@@ -1538,7 +1542,7 @@ program main
                  call VecSetValues(Vec_F,eldof,indx,f,Add_Values,ierr)
               end do
            end if
-           call FormRHS
+           call FormRHS ! adding body force and fluid source and boundary traction
            !if (poro .and. tstep>1) call AddFluidGravity
            if (fail) then
               call FaultSlip_sta
@@ -1660,6 +1664,8 @@ program main
                  ") fault nodes critical."
               if (rslip>f0 .and. sum(slip)>=1) then ! Failure threshold
                  dyn=.true.
+                 ! call GetLs
+                 ! if (tstep>1) call ResLs2dt
               end if
            end if
 
@@ -1805,6 +1811,7 @@ program main
                  dyn=.false.
                  slip=0
                  t_ext=t_ext+t_dyn
+                 if (rank==0) print'(A)',"Fault cannot stabilize!"
               end if
               ! Hybrid iteration count
               ih=ih+1
@@ -2237,4 +2244,57 @@ contains
     call VecRestoreArrayF90(Vec_Y,pntr,ierr)
   end subroutine GetVec
 
+!getting slip patch length for adjusting dt
+  subroutine GetLs
+    implicit none
+    integer :: j1,snode,enode,npatch,nnode,nlocal
+    real(8) :: lslip
+    logical :: slip_start
+    real(8),allocatable :: ncoord(:),scoord(:),ecoord(:),lncoord(:)
+    npatch=0
+    lslip_max=0
+    slip_start=.false.
+    allocate(ncoord(dmn),scoord(dmn),ecoord(dmn),lncoord(dmn))
+    do j1=1,nfnd ! problem firtst node and last node?
+      nnode=node_pos_g(j1)
+      if (npart(nnode)==1) then
+        nlocal=nmap_re(nnode)
+        lncoord=coords(nlocal,:)
+      else
+        nlocal=0
+        lncoord=0
+      end if
+      if (slip(j1)==1 .and. .not. slip_start) then
+        call MPI_Allreduce(lncoord,ncoord,dmn,MPI_Real8,MPI_SUM,      &
+          MPI_Comm_World,ierr)
+        snode=nnode
+        scoord=ncoord
+        slip_start=.true.
+      else if (slip(j1)==0 .and. slip_start)  then
+        call MPI_Allreduce(lncoord,ncoord,dmn,MPI_Real8,MPI_SUM,      &
+          MPI_Comm_World,ierr)
+        enode=nnode
+        ecoord=ncoord
+        slip_start=.false.
+        npatch=npatch+1
+        lslip=sqrt((scoord(1)-ecoord(1))**2+                            &
+          (scoord(2)-ecoord(2))**2)
+        if (lslip>lslip_max) lslip_max=lslip
+        if (rank==0) print'(I0,A,I0,A)',snode,"S; ",enode,"E "
+      end if
+    end do
+    if (rank==0) print'(I0,A)',npatch," Slip patch(es)"
+    if (rank==0) print'(F0.2,A)',lslip_max," m maximum Slip patch length"
+  end subroutine GetLs
+
+  subroutine ResLs2dt
+    implicit none
+    real(8) :: fdt
+    ! lc=16.e0
+    if (lslip_max>10) then
+      fdt = 0.2
+      call PrintMsg("Rescale new dt ...")
+      call Rscdt(fdt)
+    end if
+  end subroutine ResLs2dt
 end program main
